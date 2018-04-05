@@ -1,7 +1,7 @@
 #include <fstream>
 #include <math.h>
 #include <uWS/uWS.h>
-#include <chrono>
+#include <ctime>
 #include <iostream>
 #include <thread>
 #include <vector>
@@ -32,6 +32,44 @@ string hasData(string s) {
     return s.substr(b1, b2 - b1 + 2);
   }
   return "";
+}
+
+// Adapted from https://github.com/JuliaMath/Polynomials.jl/blob/master/src/Polynomials.jl#L676-L716
+Eigen::VectorXd polyfit(Eigen::VectorXd xvals, Eigen::VectorXd yvals,
+                        int order) {
+  assert(xvals.size() == yvals.size());
+  assert(order >= 1 && order <= xvals.size() - 1);
+  Eigen::MatrixXd A(xvals.size(), order + 1);
+
+
+
+  for (int i = 0; i < xvals.size(); i++) {
+    A(i, 0) = 1.0;
+  }
+
+
+
+  for (int j = 0; j < xvals.size(); j++) {
+    for (int i = 0; i < order; i++) {
+      A(j, i + 1) = A(j, i) * xvals(j);
+    }
+  }
+
+
+
+  auto Q = A.householderQr();
+  auto result = Q.solve(yvals);
+  return result;
+}
+
+
+// Evaluate a polynomial
+double polyeval(Eigen::VectorXd coeffs, double x) {
+  double result = 0.0;
+  for (int i = 0; i < coeffs.size(); i++) {
+    result += coeffs[i] * pow(x, i);
+  }
+  return result;
 }
 
 double distance(double x1, double y1, double x2, double y2)
@@ -72,18 +110,16 @@ int NextWaypoint(double x, double y, double theta, const vector<double> &maps_x,
 	double heading = atan2((map_y-y),(map_x-x));
 
 	double angle = fabs(theta-heading);
-  angle = min(2*pi() - angle, angle);
+  //angle = min(2*pi() - angle, angle);
 
-  if(angle > pi()/4)
-  {
-    closestWaypoint++;
-  if (closestWaypoint == maps_x.size())
-  {
-    closestWaypoint = 0;
-  }
-  }
+	if(angle > pi()/4)
+	{
+		closestWaypoint = (closestWaypoint + 1) % maps_x.size();
+	}
 
-  return closestWaypoint;
+    return closestWaypoint;
+
+ 
 }
 
 // Transform from Cartesian x,y coordinates to Frenet s,d coordinates
@@ -163,6 +199,60 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
+
+class Car {
+public:
+    double x, y, d, speed;
+
+    Car(nlohmann::json &sensor_fusion, int index) {
+      auto car = sensor_fusion[index];
+      x = car[1];
+      y = car[2];
+      double vx = car[3];
+      double vy = car[4];
+      speed = sqrt(vx * vx + vy * vy);
+      d = car[6];
+    }
+
+    double distanceTo(double to_x, double to_y) {
+      return distance(to_x, to_y, x, y);
+    }
+
+    double relativeAngleTo(double to_x, double to_y, double yaw) {
+      double angle = atan2(y - to_y, x - to_x) - yaw;
+      return atan2(sin(angle), cos(angle));
+    }
+};
+
+int car_ahead(json &sensor_fusion, double lane, double car_x, double car_y, double car_yaw, double look_ahead, bool look_back) {
+  double current_dist = 1e+10;
+  int car_index = -1;
+
+
+  for (int i = 0; i < sensor_fusion.size(); i++) {
+    auto car = Car(sensor_fusion, i);
+
+
+
+    if (car.d > 4 * lane && car.d < 4 * (lane + 1)) {
+      // We are on the same lane
+      
+      double dist = car.distanceTo(car_x, car_y);
+      current_dist = min(dist, current_dist);
+      
+      double norm_angle = fabs(car.relativeAngleTo(car_x, car_y, car_yaw));
+      bool is_in_direction = look_back ? norm_angle >= pi() * .5 : norm_angle < pi() * .5;
+
+      if (dist < look_ahead && is_in_direction) {
+        if (fabs(current_dist - dist) < 0.1) {
+          car_index = i;
+        }
+      }
+    }
+  }
+
+  return car_index;
+}
 int main() {
   uWS::Hub h;
 
@@ -182,26 +272,34 @@ int main() {
 
   string line;
   while (getline(in_map_, line)) {
-  	istringstream iss(line);
-  	double x;
-  	double y;
-  	float s;
-  	float d_x;
-  	float d_y;
-  	iss >> x;
-  	iss >> y;
-  	iss >> s;
-  	iss >> d_x;
-  	iss >> d_y;
-  	map_waypoints_x.push_back(x);
-  	map_waypoints_y.push_back(y);
-  	map_waypoints_s.push_back(s);
-  	map_waypoints_dx.push_back(d_x);
-  	map_waypoints_dy.push_back(d_y);
+    istringstream iss(line);
+    double x;
+    double y;
+    double s;
+    double d_x;
+    double d_y;
+    iss >> x;
+    iss >> y;
+    iss >> s;
+    iss >> d_x;
+    iss >> d_y;
+    map_waypoints_x.push_back(x);
+    map_waypoints_y.push_back(y);
+    map_waypoints_s.push_back(s);
+    map_waypoints_dx.push_back(d_x);
+    map_waypoints_dy.push_back(d_y);
   }
 
-  h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_dx,&map_waypoints_dy](uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
-                     uWS::OpCode opCode) {
+  int target_lane = 1;
+  double speed_limit = 49.9;
+  /** maximum speed increase for one step */
+  double inc_update = (speed_limit / 2.24) * 0.02 / 1.5;
+  double ref_speed = 0;
+  double min_speed = inc_update;
+
+  h.onMessage([&map_waypoints_x, &map_waypoints_y, &map_waypoints_s, &map_waypoints_dx, &map_waypoints_dy, &target_lane, &speed_limit, &inc_update, &ref_speed, &min_speed](
+      uWS::WebSocket<uWS::SERVER> ws, char *data, size_t length,
+      uWS::OpCode opCode) {
     // "42" at the start of the message means there's a websocket message event.
     // The 4 signifies a websocket message
     // The 2 signifies a websocket event
@@ -209,10 +307,10 @@ int main() {
     //cout << sdata << endl;
     if (length && length > 2 && data[0] == '4' && data[1] == '2') {
 
-      auto s = hasData(data);
+      auto q1 = hasData(data);
 
-      if (s != "") {
-        auto j = json::parse(s);
+      if (q1 != "") {
+        auto j = json::parse(q1);
         
         string event = j[0].get<string>();
         
@@ -224,8 +322,10 @@ int main() {
           	double car_y = j[1]["y"];
           	double car_s = j[1]["s"];
           	double car_d = j[1]["d"];
-          	double car_yaw = j[1]["yaw"];
+          	double car_yaw = deg2rad(j[1]["yaw"]);
           	double car_speed = j[1]["speed"];
+          	double car_vx    = car_speed * cos(car_yaw);
+            double car_vy    = car_speed * sin(car_yaw);
 
           	// Previous path data given to the Planner
           	auto previous_path_x = j[1]["previous_path_x"];
@@ -237,21 +337,192 @@ int main() {
           	// Sensor Fusion Data, a list of all other cars on the same side of the road.
           	auto sensor_fusion = j[1]["sensor_fusion"];
 
-          	json msgJson;
-
-          	vector<double> next_x_vals;
-          	vector<double> next_y_vals;
+          /** Length of the previous path to reuse */
+          double buf_size = previous_path_x.size() / 2;
 
 
-          	// TODO: define a path made up of (x,y) points that the car will visit sequentially every .02 seconds
-          	msgJson["next_x"] = next_x_vals;
-          	msgJson["next_y"] = next_y_vals;
 
-          	auto msg = "42[\"control\","+ msgJson.dump()+"]";
+          /** Lane where the car is */
+          int current_lane = ((int) car_d) / 4 ;
 
-          	//this_thread::sleep_for(chrono::milliseconds(1000));
-          	ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
-          
+
+
+          /** Deciding on reference points (where to continue previous path */
+          int empty_limit = 2;
+          vector<vector<double>> wpts;
+          double ref_x = car_x, ref_y = car_y, ref_yaw = car_yaw;
+
+          if (buf_size < empty_limit) {
+            double prev_x = ref_x - cos(car_yaw);
+            double prev_y = ref_y - sin(car_yaw);
+            wpts.push_back({ prev_x, prev_y });
+            wpts.push_back({ ref_x, ref_y });
+            
+          } else {
+            ref_x = previous_path_x[buf_size - 1];
+            ref_y = previous_path_y[buf_size - 1];
+
+            double prev_x = (previous_path_x[buf_size - 2]);
+            double prev_y = (previous_path_y[buf_size - 2]);
+
+            ref_yaw = atan2(ref_y - prev_y, ref_x - prev_x);
+            wpts.push_back({ prev_x, prev_y });
+            wpts.push_back({ ref_x, ref_y });
+          }
+
+          /** Distance to which car plans path on the lane */
+          double look_ahead = 60;
+
+          /** Look for the car ahead in the same lane */
+          int car_ahead_index = car_ahead(sensor_fusion, current_lane, car_x, car_y, car_yaw, look_ahead / 2, false);
+          bool is_car_ahead = car_ahead_index > -1;
+
+
+          if (is_car_ahead) {
+            /** Try to slow down to prevent collision */
+            
+            ref_speed -= inc_update;
+
+            auto car_ahead_ = Car(sensor_fusion, car_ahead_index);
+            double car_dist = car_ahead_.distanceTo(car_x, car_y);
+            
+            /** Reset the speed of the lane to the value of the car ahead */
+            min_speed = max(inc_update, car_ahead_.speed * 2.24 - (look_ahead / 2 - car_dist));
+
+
+            /** If we are not switching, consider it, as we have vehicle up ahead */
+            if (target_lane == current_lane) {
+              vector<vector<double>> lanes = { { (double) current_lane + 1, -1 }, { (double) current_lane - 1, -1 } };
+
+              int next_lane = current_lane;
+              for (auto &pair: lanes) {
+                auto lane = (int) round(pair[0]);
+                if (lane < 0 || lane > 2) {
+                  pair[1] = 1e10;
+                  continue;
+                }
+
+
+                /** Look for the cars on the target lane */
+                auto lane_car_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead, false);
+                auto lane_back_index = car_ahead(sensor_fusion, lane, car_x, car_y, car_yaw, look_ahead / 2, true);
+
+
+                /**
+                 * To switch, we consider that target lane:
+                 *  could be not empty (choose empty if there is one)
+                 *  the car on the target lane should be further that current target;
+                 *  the should not be any cars behind which could collide while switching
+                 *  between to lanes with matching conditions choose the one with higher speed
+                 */
+
+
+                if (lane_car_index != -1) {
+                  auto lane_ahead_ = Car(sensor_fusion, lane_car_index);
+                  auto lane_ahead_dist = lane_ahead_.distanceTo(car_x, car_y);
+
+                  cout <<"::(dist: " <<lane_ahead_dist <<" : " <<car_dist <<" speed: " <<lane_ahead_.speed <<" : " << car_ahead_.speed <<")::";
+                  if (lane_ahead_dist > car_dist && lane_ahead_.speed > car_ahead_.speed) {
+
+                    // Consider change
+                    pair[1] = 1000 / (lane_ahead_dist + lane_ahead_.speed);
+                    cout << "on lane" << pair[0] << " car is ahead | ";
+
+                  } else {
+                    pair[1] = 1e10;
+                    cout << "on lane " << pair[0] << " car ahead is too slow or close | ";
+                  }
+                }
+
+
+
+                if (lane_back_index != -1) {
+                  // There is car to the back, do not change there
+                  auto lane_back_ = Car(sensor_fusion, lane_back_index);
+                  pair[1] = 1e10;
+                  cout << "on lane " << pair[0] << " car is behind | ";
+                }
+
+                cout << "on lane " << pair[0] << " weight is " << pair[1] << " | ";
+              }
+              cout <<endl;
+
+              sort(lanes.begin(), lanes.end(), [](vector<double> &a, vector<double> &b) -> bool { return a[1] < b[1]; });
+              if (lanes[0][1] < 1e10) {
+                target_lane = (int) lanes[0][0];
+              }
+            }
+
+          } else if (ref_speed < speed_limit) {
+            /** If the lane is empty, maximize speed */
+            ref_speed += inc_update;
+          }
+
+          bool lane_change = target_lane != current_lane;
+
+          if (lane_change) cout <<"switch from " <<current_lane <<" to " <<target_lane <<endl;
+
+          /** Make sure the speed is within bounds */
+          ref_speed = max(min_speed, min(ref_speed, speed_limit));
+
+          /** Calculate how many meters can be crossed in one step to maintain speed */
+          double m_per_update = 0.02 * ref_speed / 2.24; // freq * speed_limit / mph to mps
+
+          /** Plot several points ahead the trajectory */
+          double dist = lane_change ? 40 : 30;
+          for (int i = 0; i < 2; ++i) {
+            wpts.push_back(getXY(car_s + (i + 1) * dist, (2 + 4 * target_lane), map_waypoints_s, map_waypoints_x, map_waypoints_y));
+          }
+
+          /** Fit cubic polynomial to the points for smoothness */
+          Eigen::VectorXd x_coords(wpts.size());
+          Eigen::VectorXd y_coords(wpts.size());
+          // Transform to car coords
+          for (int i = 0; i < wpts.size(); ++i) {
+            auto wpt = wpts[i];
+            double shift_x = wpt[0] - ref_x;
+            double shift_y = wpt[1] - ref_y;
+            x_coords[i] = (shift_x * cos(-ref_yaw) - shift_y * sin(-ref_yaw));
+            y_coords[i] = (shift_y * cos(-ref_yaw) + shift_x * sin(-ref_yaw));
+          }
+
+          auto coeffs = polyfit(x_coords, y_coords, 3);
+
+          vector<double> next_x_vals;
+          vector<double> next_y_vals;
+
+          /** Give the points to simulator: first the previous path, then along the polynomial */
+          for (int i = 0; i < buf_size; ++i) {
+            next_x_vals.push_back(previous_path_x[i]);
+            next_y_vals.push_back(previous_path_y[i]);
+          }
+
+          double target_x = look_ahead;
+          double target_y = polyeval(coeffs, target_x);
+          double target_dist = distance(0, 0, target_x, target_y);
+          double steps = target_dist / m_per_update;
+          double step = target_x / steps;
+
+          for (int i = 1; i <= 50 - buf_size - 1; ++i) {
+            double x = step * i;
+            double y = polyeval(coeffs, x);
+
+            double x_val = (x * cos(ref_yaw) - y * sin(ref_yaw)) + ref_x;
+            double y_val = (y * cos(ref_yaw) + x * sin(ref_yaw)) + ref_y;
+
+            next_x_vals.push_back(x_val);
+            next_y_vals.push_back(y_val);
+          }
+
+          json msgJson;
+
+          msgJson["next_x"] = next_x_vals;
+          msgJson["next_y"] = next_y_vals;
+
+          auto msg = "42[\"control\"," + msgJson.dump() + "]";
+
+          //this_thread::sleep_for(chrono::milliseconds(1000));
+          ws.send(msg.data(), msg.length(), uWS::OpCode::TEXT);
         }
       } else {
         // Manual driving
